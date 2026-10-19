@@ -211,6 +211,131 @@ final class DownloadManager: NSObject, ObservableObject {
         return nil
     }
 
+    // MARK: - 檔名 / 類型判斷
+
+    /// 決定最終檔名：
+    /// 1. 伺服器 Content-Disposition 指定的檔名
+    /// 2. 網址本身帶副檔名的檔名
+    /// 3. iOS 的 suggestedFilename
+    /// 最後用檔頭 magic bytes 校正副檔名（例如伺服器誤報 text/plain 導致變成 .txt）
+    private func resolveFileName(urlFileName: String, response: HTTPURLResponse?, fileAt location: URL) -> String {
+        var name: String?
+
+        if let disposition = response?.value(forHTTPHeaderField: "Content-Disposition"),
+           let parsed = Self.fileName(fromContentDisposition: disposition) {
+            name = parsed
+        }
+        if name == nil, !(urlFileName as NSString).pathExtension.isEmpty {
+            name = urlFileName
+        }
+        if name == nil, let suggested = response?.suggestedFilename, !suggested.isEmpty, suggested != "Unknown" {
+            name = suggested
+        }
+        var fileName = name ?? (urlFileName.isEmpty ? "download" : urlFileName)
+
+        // 用檔頭校正副檔名
+        if let sniffed = Self.sniffExtension(of: location) {
+            let current = (fileName as NSString).pathExtension.lowercased()
+            // 這些副檔名是「伺服器亂給」或「沒有」的情況，一律以檔頭為準
+            let untrusted: Set<String> = ["", "txt", "bin", "dat", "html", "htm", "php", "aspx", "asp", "jsp", "cgi", "tmp", "download"]
+            if untrusted.contains(current) {
+                let base = current.isEmpty ? fileName : (fileName as NSString).deletingPathExtension
+                fileName = "\(base).\(sniffed)"
+            }
+        }
+        return fileName
+    }
+
+    private static func fileName(fromContentDisposition header: String) -> String? {
+        // filename*=UTF-8''%E6%AA%94.zip 優先，其次 filename="xxx.zip"
+        for part in header.components(separatedBy: ";") {
+            let trimmed = part.trimmingCharacters(in: .whitespaces)
+            if trimmed.lowercased().hasPrefix("filename*=") {
+                var value = String(trimmed.dropFirst("filename*=".count))
+                if let range = value.range(of: "''") { value = String(value[range.upperBound...]) }
+                if let decoded = value.removingPercentEncoding, !decoded.isEmpty { return sanitize(decoded) }
+            }
+        }
+        for part in header.components(separatedBy: ";") {
+            let trimmed = part.trimmingCharacters(in: .whitespaces)
+            if trimmed.lowercased().hasPrefix("filename=") {
+                var value = String(trimmed.dropFirst("filename=".count))
+                value = value.trimmingCharacters(in: CharacterSet(charactersIn: "\"' "))
+                if !value.isEmpty { return sanitize(value) }
+            }
+        }
+        return nil
+    }
+
+    private static func sanitize(_ name: String) -> String {
+        // 去掉路徑分隔符，避免被寫到奇怪的地方
+        (name as NSString).lastPathComponent.replacingOccurrences(of: "/", with: "_")
+    }
+
+    /// 讀檔頭前 16 bytes 判斷常見檔案類型
+    private static func sniffExtension(of url: URL) -> String? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        guard let data = try? handle.read(upToCount: 16), data.count >= 4 else { return nil }
+        let b = [UInt8](data)
+
+        func starts(_ sig: [UInt8]) -> Bool {
+            b.count >= sig.count && Array(b[0..<sig.count]) == sig
+        }
+
+        if starts([0x50, 0x4B, 0x03, 0x04]) || starts([0x50, 0x4B, 0x05, 0x06]) { return "zip" }
+        if starts([0x25, 0x50, 0x44, 0x46]) { return "pdf" }
+        if starts([0x89, 0x50, 0x4E, 0x47]) { return "png" }
+        if starts([0xFF, 0xD8, 0xFF]) { return "jpg" }
+        if starts([0x47, 0x49, 0x46, 0x38]) { return "gif" }
+        if starts([0x1F, 0x8B]) { return "gz" }
+        if starts([0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C]) { return "7z" }
+        if starts([0x52, 0x61, 0x72, 0x21, 0x1A, 0x07]) { return "rar" }
+        if starts([0x42, 0x5A, 0x68]) { return "bz2" }
+        if starts([0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00]) { return "xz" }
+        if starts([0x4D, 0x5A]) { return "exe" }
+        if starts([0x7F, 0x45, 0x4C, 0x46]) { return "elf" }
+        if starts([0x49, 0x44, 0x33]) { return "mp3" }
+        if starts([0xFF, 0xFB]) || starts([0xFF, 0xF3]) || starts([0xFF, 0xF2]) { return "mp3" }
+        if starts([0x4F, 0x67, 0x67, 0x53]) { return "ogg" }
+        if starts([0x66, 0x4C, 0x61, 0x43]) { return "flac" }
+        if starts([0x1A, 0x45, 0xDF, 0xA3]) { return "mkv" }
+        if b.count >= 12, Array(b[4..<8]) == [0x66, 0x74, 0x79, 0x70] { // ....ftyp
+            let brand = String(bytes: b[8..<12], encoding: .ascii) ?? ""
+            if brand.hasPrefix("M4A") { return "m4a" }
+            if brand.hasPrefix("qt") { return "mov" }
+            if brand.hasPrefix("heic") || brand.hasPrefix("heix") || brand.hasPrefix("mif1") { return "heic" }
+            return "mp4"
+        }
+        if b.count >= 12, starts([0x52, 0x49, 0x46, 0x46]) {
+            let form = Array(b[8..<12])
+            if form == [0x57, 0x45, 0x42, 0x50] { return "webp" }
+            if form == [0x57, 0x41, 0x56, 0x45] { return "wav" }
+            if form == [0x41, 0x56, 0x49, 0x20] { return "avi" }
+        }
+        if starts([0x53, 0x51, 0x4C, 0x69, 0x74, 0x65]) { return "sqlite" }
+        return nil
+    }
+
+    /// 重新命名已完成的檔案
+    func rename(id: UUID, to newName: String) {
+        let cleaned = Self.sanitize(newName.trimmingCharacters(in: .whitespacesAndNewlines))
+        guard !cleaned.isEmpty else { return }
+        stateQueue.async {
+            guard let index = self.items.firstIndex(where: { $0.id == id }) else { return }
+            let item = self.items[index]
+            if item.status == .completed {
+                let from = self.fileURL(for: item)
+                let to = self.uniqueDestination(for: cleaned)
+                guard (try? self.fileManager.moveItem(at: from, to: to)) != nil else { return }
+                self.items[index].fileName = to.lastPathComponent
+            } else {
+                self.items[index].fileName = cleaned
+            }
+            self.publish()
+        }
+    }
+
     private func uniqueDestination(for fileName: String) -> URL {
         var candidate = documentsDirectory.appendingPathComponent(fileName)
         var counter = 1
@@ -282,11 +407,11 @@ extension DownloadManager: URLSessionDownloadDelegate {
             guard let index = self.itemIndex(for: downloadTask) else { return }
             itemID = self.items[index].id
 
-            // 優先用伺服器建議的檔名
-            var fileName = self.items[index].fileName
-            if let suggested = downloadTask.response?.suggestedFilename, !suggested.isEmpty {
-                fileName = suggested
-            }
+            let fileName = self.resolveFileName(
+                urlFileName: self.items[index].fileName,
+                response: downloadTask.response as? HTTPURLResponse,
+                fileAt: location
+            )
             let dest = self.uniqueDestination(for: fileName)
             do {
                 try self.fileManager.moveItem(at: location, to: dest)

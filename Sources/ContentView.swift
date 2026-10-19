@@ -49,8 +49,41 @@ struct ContentView: View {
 struct DownloadRow: View {
     @EnvironmentObject private var manager: DownloadManager
     let item: DownloadItem
+    @State private var showRename = false
+    @State private var newName = ""
 
     var body: some View {
+        rowContent
+            .contextMenu {
+                Button {
+                    newName = item.fileName
+                    showRename = true
+                } label: {
+                    Label("重新命名", systemImage: "pencil")
+                }
+                if item.status == .completed {
+                    ShareLink(item: manager.fileURL(for: item)) {
+                        Label("分享", systemImage: "square.and.arrow.up")
+                    }
+                }
+                Button(role: .destructive) {
+                    manager.remove(id: item.id)
+                } label: {
+                    Label("刪除", systemImage: "trash")
+                }
+            }
+            .alert("重新命名", isPresented: $showRename) {
+                TextField("檔名", text: $newName)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                Button("取消", role: .cancel) {}
+                Button("確定") { manager.rename(id: item.id, to: newName) }
+            } message: {
+                Text("改副檔名可以修正被誤判的檔案類型（例如 .txt → .zip）")
+            }
+    }
+
+    private var rowContent: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
                 Text(item.fileName)
