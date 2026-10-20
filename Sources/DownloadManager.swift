@@ -59,11 +59,40 @@ final class DownloadManager: NSObject, ObservableObject {
     static let githubTokenKey = "github_token"
 
     /// GitHub Personal Access Token（存在 Keychain）
+    /// 快取在記憶體，避免每次 SwiftUI 重繪都去讀 Keychain
+    private lazy var cachedGithubToken: String = Keychain.get(Self.githubTokenKey) ?? ""
+
     var githubToken: String {
-        get { Keychain.get(Self.githubTokenKey) ?? "" }
+        get { cachedGithubToken }
         set {
-            Keychain.set(newValue.trimmingCharacters(in: .whitespacesAndNewlines), for: Self.githubTokenKey)
+            let cleaned = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            cachedGithubToken = cleaned
+            Keychain.set(cleaned, for: Self.githubTokenKey)
             DispatchQueue.main.async { self.objectWillChange.send() }
+        }
+    }
+
+    // MARK: - 進度節流
+
+    private var progressPublishPending = false
+    private var lastProgressPublish = Date.distantPast
+    private let progressInterval: TimeInterval = 0.25
+
+    /// 進度更新只送 UI、不寫磁碟，而且最多每 0.25 秒一次（必須在 stateQueue 上呼叫）
+    private func publishProgressThrottled() {
+        let now = Date()
+        if now.timeIntervalSince(lastProgressPublish) >= progressInterval {
+            lastProgressPublish = now
+            let snapshot = items
+            DispatchQueue.main.async { self.items = snapshot }
+        } else if !progressPublishPending {
+            progressPublishPending = true
+            stateQueue.asyncAfter(deadline: .now() + progressInterval) {
+                self.progressPublishPending = false
+                self.lastProgressPublish = Date()
+                let snapshot = self.items
+                DispatchQueue.main.async { self.items = snapshot }
+            }
         }
     }
 
@@ -435,9 +464,7 @@ extension DownloadManager: URLSessionDownloadDelegate {
             self.items[index].totalBytes = totalBytesExpectedToWrite
             self.items[index].status = .downloading
             self.items[index].taskIdentifier = downloadTask.taskIdentifier
-            // 進度更新很頻繁，只更新 UI、不每次寫磁碟
-            let snapshot = self.items
-            DispatchQueue.main.async { self.items = snapshot }
+            self.publishProgressThrottled()
         }
     }
 
