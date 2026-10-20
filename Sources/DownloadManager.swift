@@ -24,7 +24,7 @@ struct DownloadItem: Identifiable, Codable, Equatable {
     init(url: URL) {
         self.id = UUID()
         self.url = url
-        self.fileName = url.lastPathComponent.isEmpty ? "download" : url.lastPathComponent
+        self.fileName = DownloadManager.defaultFileName(for: url)
     }
 }
 
@@ -53,6 +53,65 @@ final class DownloadManager: NSObject, ObservableObject {
 
     private let fileManager = FileManager.default
     private let stateQueue = DispatchQueue(label: "DownloadManager.state")
+
+    // MARK: - GitHub 設定
+
+    static let githubTokenKey = "github_token"
+
+    /// GitHub Personal Access Token（存在 Keychain）
+    var githubToken: String {
+        get { Keychain.get(Self.githubTokenKey) ?? "" }
+        set {
+            Keychain.set(newValue.trimmingCharacters(in: .whitespacesAndNewlines), for: Self.githubTokenKey)
+            DispatchQueue.main.async { self.objectWillChange.send() }
+        }
+    }
+
+    /// 解析 GitHub Actions artifact 網頁連結
+    /// https://github.com/OWNER/REPO/actions/runs/RUN/artifacts/ID
+    private static func parseGitHubArtifact(_ url: URL) -> (owner: String, repo: String, id: String)? {
+        guard let host = url.host?.lowercased(), host == "github.com" || host == "www.github.com" else { return nil }
+        let parts = url.pathComponents.filter { $0 != "/" }
+        // [OWNER, REPO, "actions", "runs", RUN, "artifacts", ID]
+        guard parts.count >= 7, parts[2] == "actions", parts[3] == "runs", parts[5] == "artifacts",
+              Int(parts[6]) != nil else { return nil }
+        return (parts[0], parts[1], parts[6])
+    }
+
+    /// 使用者看到的是原始網址，實際發出的請求可能被改寫（GitHub artifact 需要走 API 並帶 token）
+    func makeRequest(for url: URL) -> URLRequest {
+        if let artifact = Self.parseGitHubArtifact(url) {
+            let token = githubToken
+            if !token.isEmpty {
+                var request = URLRequest(url: URL(string:
+                    "https://api.github.com/repos/\(artifact.owner)/\(artifact.repo)/actions/artifacts/\(artifact.id)/zip")!)
+                request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+                request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+                request.setValue("2022-11-28", forHTTPHeaderField: "X-GitHub-Api-Version")
+                request.setValue("BackgroundDownloader-iOS", forHTTPHeaderField: "User-Agent")
+                return request
+            }
+            // 沒有 token：公開 repo 可以走 nightly.link 代理（私有 repo 會失敗）
+            return URLRequest(url: URL(string:
+                "https://nightly.link/\(artifact.owner)/\(artifact.repo)/actions/artifacts/\(artifact.id).zip")!)
+        }
+        return URLRequest(url: url)
+    }
+
+    /// 判斷某個 task 是否屬於這個項目（原始網址或改寫後的網址都算）
+    private func task(_ task: URLSessionTask, matches item: DownloadItem) -> Bool {
+        guard let taskURL = task.originalRequest?.url ?? task.currentRequest?.url else { return false }
+        if taskURL == item.url { return true }
+        if taskURL == makeRequest(for: item.url).url { return true }
+        return false
+    }
+
+    /// 預設檔名：GitHub artifact 連結本身沒有副檔名，先給 artifact-ID.zip，之後會被 Content-Disposition 覆蓋
+    static func defaultFileName(for url: URL) -> String {
+        if let artifact = parseGitHubArtifact(url) { return "artifact-\(artifact.id).zip" }
+        let last = url.lastPathComponent
+        return (last.isEmpty || last == "/") ? "download" : last
+    }
 
     // MARK: - 路徑
 
@@ -93,8 +152,7 @@ final class DownloadManager: NSObject, ObservableObject {
             self.stateQueue.async {
                 var running = Set<Int>()
                 for task in tasks {
-                    guard let url = task.originalRequest?.url ?? task.currentRequest?.url else { continue }
-                    if let index = self.items.firstIndex(where: { $0.url == url && $0.status != .completed }) {
+                    if let index = self.items.firstIndex(where: { $0.status != .completed && self.task(task, matches: $0) }) {
                         self.items[index].taskIdentifier = task.taskIdentifier
                         self.items[index].status = .downloading
                         running.insert(task.taskIdentifier)
@@ -151,7 +209,7 @@ final class DownloadManager: NSObject, ObservableObject {
             if let data = try? Data(contentsOf: self.resumeDataURL(for: id)), !data.isEmpty {
                 task = self.session.downloadTask(withResumeData: data)
             } else {
-                task = self.session.downloadTask(with: item.url)
+                task = self.session.downloadTask(with: self.makeRequest(for: item.url))
             }
             task.taskDescription = id.uuidString
             task.resume()
@@ -185,7 +243,7 @@ final class DownloadManager: NSObject, ObservableObject {
 
     private func start(item: DownloadItem) {
         stateQueue.async {
-            let task = self.session.downloadTask(with: item.url)
+            let task = self.session.downloadTask(with: self.makeRequest(for: item.url))
             task.taskDescription = item.id.uuidString
             task.resume()
             if let index = self.items.firstIndex(where: { $0.id == item.id }) {
@@ -205,10 +263,7 @@ final class DownloadManager: NSObject, ObservableObject {
             return index
         }
         // App 被重啟後 taskDescription 可能遺失，用 URL 比對
-        if let url = task.originalRequest?.url ?? task.currentRequest?.url {
-            return items.firstIndex(where: { $0.url == url && $0.status != .completed })
-        }
-        return nil
+        return items.firstIndex(where: { $0.status != .completed && self.task(task, matches: $0) })
     }
 
     // MARK: - 檔名 / 類型判斷
@@ -406,6 +461,20 @@ extension DownloadManager: URLSessionDownloadDelegate {
         stateQueue.sync {
             guard let index = self.itemIndex(for: downloadTask) else { return }
             itemID = self.items[index].id
+
+            // HTTP 4xx/5xx 代表伺服器拒絕了，存下來的只是錯誤頁，不算成功
+            if let http = downloadTask.response as? HTTPURLResponse, http.statusCode >= 400 {
+                var message = "HTTP \(http.statusCode)"
+                switch http.statusCode {
+                case 401: message += "：需要登入（GitHub artifact 請到設定填 token）"
+                case 403: message += "：沒有權限（token 需要 repo / actions:read 權限）"
+                case 404: message += "：找不到檔案（私有 repo 需要 token，或 artifact 已過期）"
+                default: break
+                }
+                moveError = NSError(domain: "HTTP", code: http.statusCode,
+                                    userInfo: [NSLocalizedDescriptionKey: message])
+                return
+            }
 
             let fileName = self.resolveFileName(
                 urlFileName: self.items[index].fileName,
