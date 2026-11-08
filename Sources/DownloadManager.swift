@@ -117,7 +117,14 @@ final class DownloadManager: NSObject, ObservableObject {
     /// 使用者看到的是原始網址，實際發出的請求可能被改寫（GitHub artifact 需要走 API 並帶 token）
     func makeRequest(for url: URL) -> URLRequest {
         if let driveURL = Self.googleDriveDirectURL(url) {
-            return URLRequest(url: driveURL)
+            var request = URLRequest(url: driveURL)
+            GoogleAuth.authorize(&request)
+            return request
+        }
+        if GoogleAuth.isGoogleHost(url) {
+            var request = URLRequest(url: url)
+            GoogleAuth.authorize(&request)
+            return request
         }
         if let artifact = Self.parseGitHubArtifact(url) {
             let token = githubToken
@@ -633,7 +640,9 @@ extension DownloadManager: URLSessionDownloadDelegate {
 
                 // Google Drive 的「仍要下載」確認頁：照網頁表單（含 uuid 等隱藏欄位）自動重送
                 if isDrive, tries < 2, let formURL = Self.downloadFormURL(in: html, base: downloadTask.currentRequest?.url) {
-                    let task = self.session.downloadTask(with: URLRequest(url: formURL))
+                    var formRequest = URLRequest(url: formURL)
+                    GoogleAuth.authorize(&formRequest)
+                    let task = self.session.downloadTask(with: formRequest)
                     task.taskDescription = self.items[index].id.uuidString
                     task.resume()
                     self.items[index].htmlRetries = tries + 1
@@ -648,7 +657,10 @@ extension DownloadManager: URLSessionDownloadDelegate {
 
                 // 把網頁上的文字顯示出來，才知道 Google 到底說了什麼
                 let pageText = Self.visibleText(of: html)
-                let snippet = pageText.isEmpty ? "" : "\n網頁內容：\(String(pageText.prefix(200)))"
+                var snippet = pageText.isEmpty ? "" : "\n網頁內容：\(String(pageText.prefix(200)))"
+                if isDrive && !GoogleAuth.isLoggedIn {
+                    snippet += "\n提示：到右上角設定登入 Google 帳號後再試"
+                }
                 let message: String
                 if isDrive {
                     message = "Google Drive 回傳的是網頁不是檔案\(snippet)"

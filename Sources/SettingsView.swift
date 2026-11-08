@@ -5,10 +5,32 @@ struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var token = ""
     @State private var showToken = false
+    @State private var showGoogleLogin = false
+    @State private var googleLoggedIn = GoogleAuth.isLoggedIn
 
     var body: some View {
         NavigationStack {
             Form {
+                Section {
+                    if googleLoggedIn {
+                        Label("已登入 Google", systemImage: "checkmark.circle.fill")
+                            .foregroundStyle(.green)
+                        Button("登出 Google", role: .destructive) {
+                            GoogleAuth.logout { googleLoggedIn = GoogleAuth.isLoggedIn }
+                        }
+                    } else {
+                        Button {
+                            showGoogleLogin = true
+                        } label: {
+                            Label("登入 Google 帳號", systemImage: "person.crop.circle.badge.plus")
+                        }
+                    }
+                } header: {
+                    Text("Google 雲端硬碟")
+                } footer: {
+                    Text("登入後下載 Google Drive 檔案會帶上你的帳號，避免被「超過配額」擋下（匿名下載的限制比較嚴）。登入完成後按右上角「完成」。登入資料只存在這支手機。")
+                }
+
                 Section {
                     HStack {
                         Group {
@@ -62,6 +84,9 @@ struct SettingsView: View {
                 }
             }
             .onAppear { token = manager.githubToken }
+            .sheet(isPresented: $showGoogleLogin) {
+                GoogleLoginView { googleLoggedIn = GoogleAuth.isLoggedIn }
+            }
         }
     }
 }
