@@ -18,6 +18,8 @@ struct DownloadItem: Identifiable, Codable, Equatable {
     var taskIdentifier: Int?
     /// 目前下載速度（bytes/s），只用來顯示
     var speed: Double?
+    /// 遇到 Google Drive 確認頁後自動重送的次數（避免無限循環）
+    var htmlRetries: Int?
 
     var progress: Double {
         totalBytes > 0 ? Double(bytesWritten) / Double(totalBytes) : 0
@@ -282,6 +284,7 @@ final class DownloadManager: NSObject, ObservableObject {
             self.items[index].taskIdentifier = task.taskIdentifier
             self.items[index].status = .downloading
             self.items[index].errorMessage = nil
+            self.items[index].htmlRetries = 0
             self.publish()
         }
     }
@@ -390,6 +393,61 @@ final class DownloadManager: NSObject, ObservableObject {
     private static func sanitize(_ name: String) -> String {
         // 去掉路徑分隔符，避免被寫到奇怪的地方
         (name as NSString).lastPathComponent.replacingOccurrences(of: "/", with: "_")
+    }
+
+    private static func readText(_ url: URL, limit: Int) -> String {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return "" }
+        defer { try? handle.close() }
+        guard let data = try? handle.read(upToCount: limit) else { return "" }
+        return String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1) ?? ""
+    }
+
+    private static func firstMatch(_ pattern: String, in text: String) -> String? {
+        guard let re = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive, .dotMatchesLineSeparators]),
+              let m = re.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+              m.numberOfRanges > 1, let r = Range(m.range(at: 1), in: text) else { return nil }
+        return String(text[r])
+    }
+
+    private static func decodeEntities(_ s: String) -> String {
+        s.replacingOccurrences(of: "&amp;", with: "&")
+         .replacingOccurrences(of: "&quot;", with: "\"")
+         .replacingOccurrences(of: "&#39;", with: "'")
+         .replacingOccurrences(of: "&lt;", with: "<")
+         .replacingOccurrences(of: "&gt;", with: ">")
+    }
+
+    /// 從 Google Drive 確認頁的 <form> 組出真正的下載網址（action + 所有 hidden input）
+    private static func downloadFormURL(in html: String, base: URL?) -> URL? {
+        guard let formTag = firstMatch("(<form[^>]*>)", in: html),
+              let action = firstMatch("action=[\"']([^\"']+)[\"']", in: formTag) else { return nil }
+        guard let actionURL = URL(string: decodeEntities(action), relativeTo: base)?.absoluteURL,
+              var comps = URLComponents(url: actionURL, resolvingAgainstBaseURL: true) else { return nil }
+        guard let re = try? NSRegularExpression(pattern: "<input[^>]*>", options: .caseInsensitive) else { return nil }
+        var items: [URLQueryItem] = comps.queryItems ?? []
+        for m in re.matches(in: html, range: NSRange(html.startIndex..., in: html)) {
+            guard let r = Range(m.range, in: html) else { continue }
+            let tag = String(html[r])
+            guard let name = firstMatch("name=[\"']([^\"']*)[\"']", in: tag), !name.isEmpty else { continue }
+            let value = decodeEntities(firstMatch("value=[\"']([^\"']*)[\"']", in: tag) ?? "")
+            items.removeAll { $0.name == name }
+            items.append(URLQueryItem(name: name, value: value))
+        }
+        guard items.contains(where: { $0.name == "id" }) else { return nil }
+        comps.queryItems = items
+        return comps.url
+    }
+
+    /// 網頁的可見文字（拿掉 script/style/標籤，壓縮空白）
+    private static func visibleText(of html: String) -> String {
+        var t = html
+        for pattern in ["<script.*?</script>", "<style.*?</style>", "<[^>]+>"] {
+            if let re = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive, .dotMatchesLineSeparators]) {
+                t = re.stringByReplacingMatches(in: t, range: NSRange(t.startIndex..., in: t), withTemplate: " ")
+            }
+        }
+        t = decodeEntities(t)
+        return t.components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }.joined(separator: " ")
     }
 
     /// 檔案開頭是不是 HTML（略過空白與 BOM）
@@ -543,6 +601,7 @@ extension DownloadManager: URLSessionDownloadDelegate {
         var destination: URL?
         var moveError: Error?
         var itemID: UUID?
+        var restarted = false
 
         stateQueue.sync {
             guard let index = self.itemIndex(for: downloadTask) else { return }
@@ -568,11 +627,33 @@ extension DownloadManager: URLSessionDownloadDelegate {
             let requested = downloadTask.originalRequest?.url ?? self.items[index].url
             let wantsHTML = ["html", "htm"].contains(self.items[index].url.pathExtension.lowercased())
             if !wantsHTML && (mime == "text/html" || Self.looksLikeHTML(location)) {
+                let html = Self.readText(location, limit: 512 * 1024)
+                let isDrive = Self.isGoogleDrive(requested) || Self.isGoogleDrive(downloadTask.currentRequest?.url)
+                let tries = self.items[index].htmlRetries ?? 0
+
+                // Google Drive 的「仍要下載」確認頁：照網頁表單（含 uuid 等隱藏欄位）自動重送
+                if isDrive, tries < 2, let formURL = Self.downloadFormURL(in: html, base: downloadTask.currentRequest?.url) {
+                    let task = self.session.downloadTask(with: URLRequest(url: formURL))
+                    task.taskDescription = self.items[index].id.uuidString
+                    task.resume()
+                    self.items[index].htmlRetries = tries + 1
+                    self.items[index].taskIdentifier = task.taskIdentifier
+                    self.items[index].status = .downloading
+                    self.items[index].bytesWritten = 0
+                    self.items[index].totalBytes = 0
+                    self.publish()
+                    restarted = true
+                    return
+                }
+
+                // 把網頁上的文字顯示出來，才知道 Google 到底說了什麼
+                let pageText = Self.visibleText(of: html)
+                let snippet = pageText.isEmpty ? "" : "\n網頁內容：\(String(pageText.prefix(200)))"
                 let message: String
-                if Self.isGoogleDrive(requested) || Self.isGoogleDrive(downloadTask.currentRequest?.url) {
-                    message = "Google Drive 回傳的是網頁不是檔案：檔案可能沒有設成「知道連結的人都能檢視」，或下載次數配額已滿"
+                if isDrive {
+                    message = "Google Drive 回傳的是網頁不是檔案\(snippet)"
                 } else {
-                    message = "伺服器回傳的是網頁不是檔案（可能需要登入或連結已失效）"
+                    message = "伺服器回傳的是網頁不是檔案（可能需要登入或連結已失效）\(snippet)"
                 }
                 moveError = NSError(domain: "HTML", code: 0, userInfo: [NSLocalizedDescriptionKey: message])
                 return
@@ -592,7 +673,7 @@ extension DownloadManager: URLSessionDownloadDelegate {
             }
         }
 
-        guard let itemID else { return }
+        guard let itemID, !restarted else { return }
         stateQueue.async {
             self.speedSamples[itemID] = nil
             guard let index = self.items.firstIndex(where: { $0.id == itemID }) else { return }
