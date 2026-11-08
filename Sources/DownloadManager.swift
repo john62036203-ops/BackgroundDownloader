@@ -20,6 +20,8 @@ struct DownloadItem: Identifiable, Codable, Equatable {
     var speed: Double?
     /// 遇到 Google Drive 確認頁後自動重送的次數（避免無限循環）
     var htmlRetries: Int?
+    /// 從內建瀏覽器攔截到的下載要帶的 header（Cookie、Referer、User-Agent）
+    var headers: [String: String]?
 
     var progress: Double {
         totalBytes > 0 ? Double(bytesWritten) / Double(totalBytes) : 0
@@ -248,6 +250,25 @@ final class DownloadManager: NSObject, ObservableObject {
 
     // MARK: - 公開操作
 
+    /// 內建瀏覽器攔截到的下載：帶著網頁的 cookie / referer 一起交給背景下載
+    func add(url: URL, headers: [String: String], suggestedName: String?) {
+        var item = DownloadItem(url: url)
+        item.headers = headers
+        if let name = suggestedName, !name.isEmpty { item.fileName = Self.sanitize(name) }
+        stateQueue.async {
+            self.items.insert(item, at: 0)
+            self.publish()
+        }
+        start(item: item)
+    }
+
+    /// 依項目產生請求（加上它自己帶的 header）
+    private func request(for item: DownloadItem) -> URLRequest {
+        var request = makeRequest(for: item.url)
+        for (k, v) in item.headers ?? [:] { request.setValue(v, forHTTPHeaderField: k) }
+        return request
+    }
+
     func add(urlString: String) {
         guard let url = URL(string: urlString.trimmingCharacters(in: .whitespacesAndNewlines)),
               let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else { return }
@@ -283,7 +304,7 @@ final class DownloadManager: NSObject, ObservableObject {
             if let data = try? Data(contentsOf: self.resumeDataURL(for: id)), !data.isEmpty {
                 task = self.session.downloadTask(withResumeData: data)
             } else {
-                task = self.session.downloadTask(with: self.makeRequest(for: item.url))
+                task = self.session.downloadTask(with: self.request(for: item))
             }
             task.taskDescription = id.uuidString
             task.resume()
@@ -318,7 +339,7 @@ final class DownloadManager: NSObject, ObservableObject {
 
     private func start(item: DownloadItem) {
         stateQueue.async {
-            let task = self.session.downloadTask(with: self.makeRequest(for: item.url))
+            let task = self.session.downloadTask(with: self.request(for: item))
             task.taskDescription = item.id.uuidString
             task.resume()
             if let index = self.items.firstIndex(where: { $0.id == item.id }) {

@@ -4,6 +4,7 @@ struct ContentView: View {
     @EnvironmentObject private var manager: DownloadManager
     @State private var urlText = ""
     @State private var showSettings = false
+    @State private var browserURL: BrowserTarget?
 
     var body: some View {
         NavigationStack {
@@ -19,6 +20,11 @@ struct ContentView: View {
                         Button("下載", action: addDownload)
                             .buttonStyle(.borderedProminent)
                             .disabled(urlText.trimmingCharacters(in: .whitespaces).isEmpty)
+                    }
+                    Button {
+                        openBrowser()
+                    } label: {
+                        Label("用內建瀏覽器打開（下載頁網址用這個）", systemImage: "safari")
                     }
                 }
 
@@ -50,7 +56,18 @@ struct ContentView: View {
             .sheet(isPresented: $showSettings) {
                 SettingsView().environmentObject(manager)
             }
+            .fullScreenCover(item: $browserURL) { target in
+                BrowserView(startURL: target.url).environmentObject(manager)
+            }
         }
+    }
+
+    private func openBrowser() {
+        var t = urlText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !t.isEmpty && !t.lowercased().hasPrefix("http") { t = "https://" + t }
+        let url = URL(string: t).flatMap { $0.host == nil ? nil : $0 } ?? URL(string: "https://www.google.com")!
+        urlText = ""
+        browserURL = BrowserTarget(url: url)
     }
 
     private func addDownload() {
@@ -179,4 +196,9 @@ struct DownloadRow: View {
 
 #Preview {
     ContentView().environmentObject(DownloadManager.shared)
+}
+
+struct BrowserTarget: Identifiable {
+    let id = UUID()
+    let url: URL
 }
