@@ -83,7 +83,7 @@ final class DownloadManager: NSObject, ObservableObject {
 
     private var progressPublishPending = false
     private var lastProgressPublish = Date.distantPast
-    private let progressInterval: TimeInterval = 0.25
+    private let progressInterval: TimeInterval = 0.5
 
     /// 進度更新只送 UI、不寫磁碟，而且最多每 0.25 秒一次（必須在 stateQueue 上呼叫）
     private func publishProgressThrottled() {

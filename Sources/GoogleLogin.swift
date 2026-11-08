@@ -62,15 +62,12 @@ struct GoogleLoginView: View {
     var onFinish: () -> Void
 
     var body: some View {
-        NavigationStack {
-            GoogleWebView()
+        // 用 push 進來的頁面，不再開「sheet 裡的 sheet」（巢狀 sheet 關掉後有機會讓整個畫面點不動）
+        GoogleWebView()
                 .ignoresSafeArea(edges: .bottom)
                 .navigationTitle("登入 Google")
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
-                    ToolbarItem(placement: .cancellationAction) {
-                        Button("取消") { dismiss() }
-                    }
                     ToolbarItem(placement: .confirmationAction) {
                         Button("完成") {
                             GoogleAuth.importCookies(from: WKWebsiteDataStore.default().httpCookieStore) { _ in
@@ -82,7 +79,6 @@ struct GoogleLoginView: View {
                         }
                     }
                 }
-        }
     }
 }
 

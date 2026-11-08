@@ -5,7 +5,6 @@ struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var token = ""
     @State private var showToken = false
-    @State private var showGoogleLogin = false
     @State private var googleLoggedIn = GoogleAuth.isLoggedIn
 
     var body: some View {
@@ -19,8 +18,8 @@ struct SettingsView: View {
                             GoogleAuth.logout { googleLoggedIn = GoogleAuth.isLoggedIn }
                         }
                     } else {
-                        Button {
-                            showGoogleLogin = true
+                        NavigationLink {
+                            GoogleLoginView { googleLoggedIn = GoogleAuth.isLoggedIn }
                         } label: {
                             Label("登入 Google 帳號", systemImage: "person.crop.circle.badge.plus")
                         }
@@ -84,9 +83,7 @@ struct SettingsView: View {
                 }
             }
             .onAppear { token = manager.githubToken }
-            .sheet(isPresented: $showGoogleLogin) {
-                GoogleLoginView { googleLoggedIn = GoogleAuth.isLoggedIn }
-            }
+
         }
     }
 }
