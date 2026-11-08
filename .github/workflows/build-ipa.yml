@@ -5,6 +5,9 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: macos-15
@@ -47,3 +50,10 @@ jobs:
           name: BackgroundDownloader-${{ github.run_number }}
           path: "*.ipa"
           retention-days: 30
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: BackgroundDownloader build ${{ github.run_number }}
+          files: "*.ipa"

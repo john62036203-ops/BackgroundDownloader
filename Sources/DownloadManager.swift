@@ -16,6 +16,8 @@ struct DownloadItem: Identifiable, Codable, Equatable {
     var errorMessage: String?
     /// 目前對應的 URLSessionTask id（重啟後會重新對應）
     var taskIdentifier: Int?
+    /// 目前下載速度（bytes/s），只用來顯示
+    var speed: Double?
 
     var progress: Double {
         totalBytes > 0 ? Double(bytesWritten) / Double(totalBytes) : 0
@@ -74,6 +76,9 @@ final class DownloadManager: NSObject, ObservableObject {
 
     // MARK: - 進度節流
 
+    /// 計算速度用的上一次取樣（只在 stateQueue 上存取）
+    private var speedSamples: [UUID: (time: Date, bytes: Int64)] = [:]
+
     private var progressPublishPending = false
     private var lastProgressPublish = Date.distantPast
     private let progressInterval: TimeInterval = 0.25
@@ -109,6 +114,9 @@ final class DownloadManager: NSObject, ObservableObject {
 
     /// 使用者看到的是原始網址，實際發出的請求可能被改寫（GitHub artifact 需要走 API 並帶 token）
     func makeRequest(for url: URL) -> URLRequest {
+        if let driveURL = Self.googleDriveDirectURL(url) {
+            return URLRequest(url: driveURL)
+        }
         if let artifact = Self.parseGitHubArtifact(url) {
             let token = githubToken
             if !token.isEmpty {
@@ -127,6 +135,33 @@ final class DownloadManager: NSObject, ObservableObject {
         return URLRequest(url: url)
     }
 
+    static func isGoogleDrive(_ url: URL?) -> Bool {
+        guard let host = url?.host?.lowercased() else { return false }
+        return host == "drive.google.com" || host == "drive.usercontent.google.com" || host == "docs.google.com"
+    }
+
+    /// Google Drive 連結 → 直接下載網址，並加上 confirm=t 跳過大檔案的「無法掃描病毒」警告頁
+    /// 支援：/file/d/ID/view、open?id=ID、uc?id=ID、drive.usercontent.google.com/download?id=ID
+    static func googleDriveDirectURL(_ url: URL) -> URL? {
+        guard isGoogleDrive(url), url.host?.lowercased() != "docs.google.com" else { return nil }
+        let comps = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        var id = comps?.queryItems?.first(where: { $0.name == "id" })?.value
+        if id == nil {
+            let parts = url.pathComponents
+            if let d = parts.firstIndex(of: "d"), d + 1 < parts.count { id = parts[d + 1] }
+        }
+        guard let fileID = id, !fileID.isEmpty else { return nil }
+        var out = URLComponents(string: "https://drive.usercontent.google.com/download")!
+        var items = [URLQueryItem(name: "id", value: fileID),
+                     URLQueryItem(name: "export", value: "download"),
+                     URLQueryItem(name: "confirm", value: "t")]
+        if let rk = comps?.queryItems?.first(where: { $0.name == "resourcekey" })?.value {
+            items.append(URLQueryItem(name: "resourcekey", value: rk))
+        }
+        out.queryItems = items
+        return out.url
+    }
+
     /// 判斷某個 task 是否屬於這個項目（原始網址或改寫後的網址都算）
     private func task(_ task: URLSessionTask, matches item: DownloadItem) -> Bool {
         guard let taskURL = task.originalRequest?.url ?? task.currentRequest?.url else { return false }
@@ -138,6 +173,7 @@ final class DownloadManager: NSObject, ObservableObject {
     /// 預設檔名：GitHub artifact 連結本身沒有副檔名，先給 artifact-ID.zip，之後會被 Content-Disposition 覆蓋
     static func defaultFileName(for url: URL) -> String {
         if let artifact = parseGitHubArtifact(url) { return "artifact-\(artifact.id).zip" }
+        if isGoogleDrive(url) { return "download" }
         let last = url.lastPathComponent
         return (last.isEmpty || last == "/") ? "download" : last
     }
@@ -356,6 +392,16 @@ final class DownloadManager: NSObject, ObservableObject {
         (name as NSString).lastPathComponent.replacingOccurrences(of: "/", with: "_")
     }
 
+    /// 檔案開頭是不是 HTML（略過空白與 BOM）
+    private static func looksLikeHTML(_ url: URL) -> Bool {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
+        defer { try? handle.close() }
+        guard let data = try? handle.read(upToCount: 512),
+              let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1) else { return false }
+        let head = text.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "\u{FEFF}"))).lowercased()
+        return head.hasPrefix("<!doctype html") || head.hasPrefix("<html")
+    }
+
     /// 讀檔頭前 16 bytes 判斷常見檔案類型
     private static func sniffExtension(of url: URL) -> String? {
         guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
@@ -460,6 +506,19 @@ extension DownloadManager: URLSessionDownloadDelegate {
                     totalBytesExpectedToWrite: Int64) {
         stateQueue.async {
             guard let index = self.itemIndex(for: downloadTask) else { return }
+            let id = self.items[index].id
+            let now = Date()
+            if let last = self.speedSamples[id] {
+                let dt = now.timeIntervalSince(last.time)
+                if dt >= 1 {
+                    let instant = Double(totalBytesWritten - last.bytes) / dt
+                    let prev = self.items[index].speed ?? instant
+                    self.items[index].speed = max(0, prev * 0.6 + instant * 0.4)
+                    self.speedSamples[id] = (now, totalBytesWritten)
+                }
+            } else {
+                self.speedSamples[id] = (now, totalBytesWritten)
+            }
             self.items[index].bytesWritten = totalBytesWritten
             self.items[index].totalBytes = totalBytesExpectedToWrite
             self.items[index].status = .downloading
@@ -503,6 +562,22 @@ extension DownloadManager: URLSessionDownloadDelegate {
                 return
             }
 
+            // 伺服器回傳的是網頁（例如 Google Drive 警告頁、登入頁），不是檔案 → 當成失敗
+            let http = downloadTask.response as? HTTPURLResponse
+            let mime = (http?.mimeType ?? "").lowercased()
+            let requested = downloadTask.originalRequest?.url ?? self.items[index].url
+            let wantsHTML = ["html", "htm"].contains(self.items[index].url.pathExtension.lowercased())
+            if !wantsHTML && (mime == "text/html" || Self.looksLikeHTML(location)) {
+                let message: String
+                if Self.isGoogleDrive(requested) || Self.isGoogleDrive(downloadTask.currentRequest?.url) {
+                    message = "Google Drive 回傳的是網頁不是檔案：檔案可能沒有設成「知道連結的人都能檢視」，或下載次數配額已滿"
+                } else {
+                    message = "伺服器回傳的是網頁不是檔案（可能需要登入或連結已失效）"
+                }
+                moveError = NSError(domain: "HTML", code: 0, userInfo: [NSLocalizedDescriptionKey: message])
+                return
+            }
+
             let fileName = self.resolveFileName(
                 urlFileName: self.items[index].fileName,
                 response: downloadTask.response as? HTTPURLResponse,
@@ -519,11 +594,15 @@ extension DownloadManager: URLSessionDownloadDelegate {
 
         guard let itemID else { return }
         stateQueue.async {
+            self.speedSamples[itemID] = nil
             guard let index = self.items.firstIndex(where: { $0.id == itemID }) else { return }
             if let destination {
                 self.items[index].fileName = destination.lastPathComponent
                 self.items[index].status = .completed
+                let size = (try? self.fileManager.attributesOfItem(atPath: destination.path)[.size] as? NSNumber)?.int64Value
+                if let size { self.items[index].totalBytes = size }
                 self.items[index].bytesWritten = self.items[index].totalBytes
+                self.items[index].speed = nil
                 self.items[index].taskIdentifier = nil
                 try? self.fileManager.removeItem(at: self.resumeDataURL(for: itemID))
             } else {
@@ -547,6 +626,8 @@ extension DownloadManager: URLSessionDownloadDelegate {
             }
 
             self.items[index].taskIdentifier = nil
+            self.items[index].speed = nil
+            self.speedSamples[id] = nil
             if nsError.code == NSURLErrorCancelled {
                 self.items[index].status = .paused
             } else {

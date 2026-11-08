@@ -113,17 +113,28 @@ struct DownloadRow: View {
                         .foregroundStyle(.green)
                 }
             } else {
-                ProgressView(value: item.progress)
+                if item.status == .downloading && item.totalBytes <= 0 {
+                    HStack { // 不知道總大小：顯示轉圈
+                        ProgressView().controlSize(.small)
+                        Spacer()
+                    }
+                } else {
+                    ProgressView(value: item.progress)
+                }
                 HStack {
                     Text(statusText)
                         .font(.caption)
                         .foregroundStyle(item.status == .failed ? .red : .secondary)
                     Spacer()
-                    if item.totalBytes > 0 {
-                        Text("\(format(item.bytesWritten)) / \(format(item.totalBytes))")
-                            .font(.caption.monospacedDigit())
-                            .foregroundStyle(.secondary)
+                    Group {
+                        if item.totalBytes > 0 {
+                            Text("\(format(item.bytesWritten)) / \(format(item.totalBytes))")
+                        } else if item.bytesWritten > 0 {
+                            Text("已下載 \(format(item.bytesWritten))")
+                        }
                     }
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
                 }
             }
         }
@@ -151,7 +162,10 @@ struct DownloadRow: View {
     private var statusText: String {
         switch item.status {
         case .queued: return "等待中"
-        case .downloading: return "下載中 \(Int(item.progress * 100))%"
+        case .downloading:
+            let speed = item.speed.map { " · \(format(Int64($0)))/s" } ?? ""
+            if item.totalBytes > 0 { return "下載中 \(Int(item.progress * 100))%\(speed)" }
+            return item.bytesWritten > 0 ? "下載中（大小未知）\(speed)" : "連線中…"
         case .paused: return "已暫停，可續傳"
         case .failed: return "失敗：\(item.errorMessage ?? "未知錯誤")（點擊重試會續傳）"
         case .completed: return "已完成"
